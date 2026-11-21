@@ -1,47 +1,66 @@
-
 name: DragonEngine APK Build
 
 on:
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK and NDK
+      - name: Unzip project zip
+        id: unzip
         run: |
-          sdkmanager --install \
-            "platforms;android-34" \
-            "build-tools;34.0.0" \
-            "ndk;24.0.8215888"
+          set -eo pipefail
+          zip=$(find . -maxdepth 2 -iname "*.zip" -not -path "./.git/*" | head -n 1)
+          if [ -z "$zip" ]; then
+            echo "ERROR: repo mein koi .zip file nahi mili (DragonEngine_v3.zip repo ke root mein upload karo)."
+            find . -maxdepth 2 -not -path "./.git/*" | head -50
+            exit 1
+          fi
+          echo "Using zip: $zip"
+          rm -rf "$RUNNER_TEMP/proj"
+          mkdir -p "$RUNNER_TEMP/proj"
+          unzip -q "$zip" -d "$RUNNER_TEMP/proj"
+          gw=$(find "$RUNNER_TEMP/proj" -maxdepth 4 -name gradlew | head -n 1)
+          if [ -z "$gw" ]; then
+            echo "ERROR: zip ke andar gradlew nahi mila. Zip ka structure:"
+            find "$RUNNER_TEMP/proj" -maxdepth 3 | head -50
+            exit 1
+          fi
+          dir=$(dirname "$gw")
+          chmod +x "$gw"
+          echo "Gradle project directory: $dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
 
-      - name: Extract Project ZIP
+      - name: Install Android SDK components
         run: |
-          unzip -q DragonEngine_v3.zip -d extracted
-          ls extracted/DragonEngine
+          set -eo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" "ndk;24.0.8215888"
 
-      - name: Build DragonEngine APK
-        working-directory: extracted/DragonEngine
-        run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug --stacktrace
+      - name: Build debug APK
+        working-directory: ${{ steps.unzip.outputs.dir }}
+        run: ./gradlew --no-daemon --stacktrace assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: DragonEngine-APK
-          path: extracted/DragonEngine/app/build/outputs/apk/debug/*.apk
+          name: DragonEngine-debug-apk
+          path: ${{ steps.unzip.outputs.dir }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
