@@ -3,39 +3,116 @@ name: DragonEngine APK Build
 on:
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     steps:
       - uses: actions/checkout@v4
+
+      - name: Prepare log folder
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs"
+          echo "LOGS=$RUNNER_TEMP/logs" >> "$GITHUB_ENV"
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
+      # Works with both layouts: project files committed in the repo (root or a subfolder),
+      # or only a project .zip committed.
+      - name: Locate Gradle project
+        id: locate
+        run: |
+          set -eo pipefail
+          gw=$(find . -maxdepth 3 -name gradlew -not -path "./.git/*" | head -n 1)
+          if [ -z "$gw" ]; then
+            zip=$(find . -maxdepth 2 -iname "*.zip" -not -path "./.git/*" | head -n 1)
+            if [ -z "$zip" ]; then
+              echo "ERROR: no gradlew and no .zip found in the repository. Repository contents:"
+              find . -maxdepth 3 -not -path "./.git/*" | head -60
+              exit 1
+            fi
+            echo "gradlew not in repo, unzipping $zip"
+            mkdir -p "$RUNNER_TEMP/proj"
+            unzip -q -o "$zip" -d "$RUNNER_TEMP/proj"
+            gw=$(find "$RUNNER_TEMP/proj" -maxdepth 4 -name gradlew | head -n 1)
+            if [ -z "$gw" ]; then
+              echo "ERROR: no gradlew inside $zip"
+              find "$RUNNER_TEMP/proj" -maxdepth 3 | head -60
+              exit 1
+            fi
+          fi
+          dir=$(cd "$(dirname "$gw")" && pwd)
+          chmod +x "$dir/gradlew"
+          echo "Gradle project directory: $dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
       # Caches downloaded dependencies between runs (fewer requests to Maven Central).
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Make gradlew executable
-        run: chmod +x gradlew
+      - name: Install Android SDK components
+        run: |
+          set -o pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          { yes | "$SDKMANAGER" --licenses > /dev/null; } || true
+          "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" "ndk;24.0.8215888" 2>&1 | tee "$LOGS/sdkmanager.log"
 
-      # Maven Central sometimes answers 429 (Too Many Requests) on shared CI addresses.
-      # Retry with a growing pause instead of failing the whole job.
+      # Retries only for network problems (e.g. Maven Central 429). A real compile error fails at once.
       - name: Build debug APK
+        working-directory: ${{ steps.locate.outputs.dir }}
         run: |
           for i in 1 2 3 4; do
-            ./gradlew assembleDebug --no-daemon --stacktrace && exit 0
-            echo "Attempt $i failed, retrying in $((i*45)) seconds"
-            sleep $((i*45))
+            set +e
+            ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee "$LOGS/gradle.log"
+            rc=${PIPESTATUS[0]}
+            set -e
+            [ "$rc" -eq 0 ] && exit 0
+            if grep -qiE "HTTP.*429|status code 429|Could not (resolve|GET|HEAD)|Read timed out|Connection (reset|timed out)|status code 5[0-9][0-9]" "$LOGS/gradle.log"; then
+              echo "Network problem on attempt $i, retrying in $((i*45)) seconds"
+              sleep $((i*45))
+            else
+              echo "Build error (not a network problem), not retrying"
+              exit "$rc"
+            fi
           done
           exit 1
+
+      - name: Show errors on the summary page
+        if: always()
+        run: |
+          for f in sdkmanager gradle; do
+            log="$LOGS/$f.log"
+            [ -f "$log" ] || continue
+            {
+              echo "### $f.log (last 60 lines)"
+              echo '```'
+              tail -n 60 "$log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            msg=$(grep -E "error:|FAILED|What went wrong|Execution failed" "$log" | head -n 12 | cut -c1-300 | head -c 3000 | sed ':a;N;$!ba;s/\n/%0A/g')
+            [ -n "$msg" ] && echo "::error title=$f errors::$msg"
+          done
+          true
 
       - uses: actions/upload-artifact@v4
         with:
           name: DragonEngine-APK
           path: |
-            app/build/outputs/apk/debug/*.apk
-            app/build/intermediates/cxx/Debug/*/obj/local/arm64-v8a/libDARK_OWNER.so
+            ${{ steps.locate.outputs.dir }}/app/build/outputs/apk/debug/*.apk
+            ${{ steps.locate.outputs.dir }}/app/build/intermediates/cxx/Debug/*/obj/local/arm64-v8a/libDARK_OWNER.so
           if-no-files-found: warn
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: ${{ runner.temp }}/logs
+          if-no-files-found: ignore
           
